@@ -74,17 +74,68 @@ options:
    * `-searchdir SEARCHDIR`  Папка для поиска треков (используется с -list)
    * `-mass MASS`            Путь к папке с TXT-файлами для массового создания плейлистов
    * `-abs, --absolute`      Использовать абсолютные пути в плейлисте
+   * `-rel, --relative-base` Базовый путь для относительных ссылок (например: '/files/mp3', Пути в плейлисте будут начинаться с этого префикса.
+   * `-name, --playlist-name` Имя плейлиста для записи в заголовок файла (поддерживается в PLS, XSPF, WPL, M3U, M3U8
+
+Порядок флагов: -rel игнорируется, если указан -abs (абсолютные пути имеют приоритет)
+
+Формат -rel: указывайте путь с прямыми слэшами, например -rel "/files/mp3"
+
+Поиск префикса: скрипт ищет вхождение -rel пути в полный путь файла — убедитесь, что префикс точно соответствует части пути
+
+Для Navidrome: если библиотека смонтирована как /music, используйте -rel "/music" для совместимости путей
 
 
 Пример создания плейлиста из разных папок:
 ```bash
 plscreate -list favorite_songs.txt -searchdir "d:/Music/Library" -f m3u8 -savedir 'd:/playlists'
 ```
-Создание плейлистов по папкам: 
+#Создание плейлистов по папкам: 
 ```bash
-Пример: plscreate 'd:/Music/Library' -f xspf
+plscreate 'd:/Music/Library' -f xspf
 ```
-Пакетное создание плейлистов:
+#Пакетное создание плейлистов:
 ```bash
-plscreate plscreate -mass "d:/Music/txt" -searchdir "d:/Music/Library" -savedir 'd:/playlists'-f m3u8
+plscreate -mass "d:/Music/txt" -searchdir "d:/Music/Library" -savedir 'd:/playlists' -f m3u8
+
+# Создать плейлисты БЕЗ имени в заголовке (по умолчанию)
+python playlist.py "D:\Music" -f m3u8
+
+# Создать плейлисты С именем папки в заголовке
+python playlist.py "D:\Music" -f m3u8 -name
+
+# Массовое создание с именем файла в заголовке
+python playlist.py -mass "D:\lists" -searchdir "D:\Music" -f pls -name
+```
+
+## fixtags - исправление кодировки и версии тегов на utf-8
+* `directory`               путь к папке
+* `-h, --help`           show this help message and exit
+* `--dry-run`,         только показать, что может быть исправлено
+* `--ext`,         расширение файла (по умолчанию mp3)
+* 
+**Пример:** 
+```bash
+fixtags 'D:\Music' --dry-run --ext mp3
+```
+
+## cue2mp3 - конвертер cue/flac в mp3
+directory`               путь к папке
+* `-i"` `--input` Путь к CUE-файлу
+* `-o` `--output` Папка вывода (по умолчанию: mp3_output)
+* `-q` `--quality` Качество: 'v0' (LAME VBR V0, прозрачное) или '320' (CBR 320kbps)
+* 
+**Пример:** 
+```bash
+# Показать справку
+python cue2mp3 -h
+
+# Базовый запуск
+python cue2mp3 -i album.cue
+
+# Указать папку вывода
+python cue2mp3 -i album.cue -o ./my_mp3_folder
+
+# Принудительно CBR 320 kbps вместо VBR
+python cue2mp3-i album.cue -q 320
 ```

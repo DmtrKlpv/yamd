@@ -5,15 +5,13 @@ from xml.dom import minidom
 import sys
 import re
 
-
 class Colors:
-    GREEN, RED, YELLOW, CYAN, BOLD, END = '\033[92m', '\033[91m', '\033[93m', '\033[96m', '\033[1m', '\033[0m'
+    GREEN, RED, YELLOW, CYAN, GRAY, BOLD, END = '\033[92m', '\033[91m', '\033[93m', '\033[96m', '\033[90m', '\033[1m', '\033[0m'
 
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description=f"{Colors.CYAN}Утилита для создания плейлистов.{Colors.END}",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Утилита для создания плейлистов."
     )
     parser.add_argument("path", nargs="?", help="Путь к музыке (откуда брать папки)")
     parser.add_argument(
@@ -31,52 +29,177 @@ def get_args():
     parser.add_argument("-mass", help="Путь к папке с TXT-файлами для массового создания плейлистов")
     parser.add_argument("-searchdir", help="Папка для поиска треков (используется с -list или -mass)")
     parser.add_argument("-abs", "--absolute", action="store_true", help="Использовать абсолютные пути в плейлисте")
+    parser.add_argument("-rel", "--relative-base",
+                        help="Базовый путь для относительных ссылок (например: '/music'). "
+                             "Пути в плейлисте будут начинаться с этого префикса (регистр не важен).")
+    parser.add_argument("-name", "--use-folder-name", action="store_true",
+                        help="Записать имя папки в заголовок плейлиста (поддерживается в PLS, XSPF, WPL, M3U)")
     return parser.parse_args()
 
 
 def normalize_name(name):
     """Очистка имени: убирает расширение, пунктуацию и лишние пробелы"""
     name = os.path.splitext(name)[0]
-    # Заменяем все не-буквы и не-цифры на пробелы
     name = re.sub(r'[^\w\s]', ' ', name)
     return " ".join(name.lower().split())
 
 
 def choose_format():
     formats = {"1": "m3u", "2": "m3u8", "3": "pls", "4": "xspf", "5": "wpl"}
-    print(f"{Colors.BOLD}Выберите формат:{Colors.END}\n"
-          f"1. M3U\n2. M3U8\n3. PLS\n4. XSPF\n5. WPL")
-    return formats.get(input(f"{Colors.YELLOW}Введите номер: {Colors.END}").strip(), "m3u8")
+    print("Выберите формат:\n"
+          "1. M3U\n2. M3U8\n3. PLS\n4. XSPF\n5. WPL")
+    return formats.get(input("Введите номер: ").strip(), "m3u8")
 
 
-def save_playlist(path, tracks, ext, name):
-    if not tracks: return
+def format_path(full_path, base_dir=None, absolute=False, rel_base=None):
+    """
+    Форматирует путь согласно настройкам:
+    - Заменяет \\ на /
+    - Если указан rel_base, обрезает путь до этого префикса (без учёта регистра)
+    - Иначе использует относительный путь от base_dir или абсолютный
+    """
+    path = full_path.replace('\\', '/')
+
+    if absolute:
+        return path
+
+    if rel_base:
+        rel_base_norm = rel_base.replace('\\', '/').rstrip('/')
+        path_lower = path.lower()
+        rel_base_lower = rel_base_norm.lower()
+
+        if rel_base_lower in path_lower:
+            idx = path_lower.find(rel_base_lower)
+            if idx != -1:
+                result = rel_base_norm + path[idx + len(rel_base_norm):]
+                return result
+
+        print(f" Префикс '{rel_base}' не найден в пути: {path}")
+        return path
+
+    if base_dir:
+        try:
+            return os.path.relpath(full_path, base_dir).replace('\\', '/')
+        except ValueError:
+            pass
+    return path
+
+
+def normalize_track_path(path):
+    """Нормализует путь трека для сравнения: заменяет слэши, приводит к нижнему регистру"""
+    return path.replace('\\', '/').lower().strip()
+
+
+def read_playlist_tracks(playlist_path, ext):
+    """
+    Читает существующий плейлист и возвращает список нормализованных путей треков.
+    Поддерживает: m3u, m3u8, pls, xspf, wpl
+    """
+    if not os.path.exists(playlist_path):
+        return None
+
+    tracks = []
     try:
         if ext in ['m3u', 'm3u8']:
-            enc = 'utf-8' if ext == 'm3u8' else 'cp1251'
+            enc = 'utf-8-sig' if ext == 'm3u8' else 'cp1251'
+            with open(playlist_path, 'r', encoding=enc, errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        tracks.append(normalize_track_path(line))
+
+        elif ext == 'pls':
+            with open(playlist_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.lower().startswith('file'):
+                        _, path = line.split('=', 1)
+                        tracks.append(normalize_track_path(path))
+
+        elif ext in ['xspf', 'wpl']:
+            tree = ET.parse(playlist_path)
+            root = tree.getroot()
+            if ext == 'xspf':
+                # XSPF: <location> внутри <track>
+                for loc in root.iter('{http://xspf.org}location'):
+                    if loc.text:
+                        tracks.append(normalize_track_path(loc.text))
+            else:
+                # WPL: <media src="...">
+                for media in root.iter('media'):
+                    src = media.get('src')
+                    if src:
+                        tracks.append(normalize_track_path(src))
+
+        return sorted(tracks)
+    except Exception:
+        return None
+
+
+def save_playlist(path, tracks, ext, name, use_folder_name=False):
+    """
+    Сохраняет плейлист в указанный формат.
+    Если плейлист существует и содержимое не изменилось — пропускает создание.
+    """
+    if not tracks:
+        return
+
+    # Нормализуем новые треки для сравнения
+    new_tracks = sorted([normalize_track_path(t) for t in tracks])
+
+    # Если плейлист уже существует — проверяем, изменилось ли содержимое
+    if os.path.exists(path):
+        old_tracks = read_playlist_tracks(path, ext)
+        if old_tracks is not None and old_tracks == new_tracks:
+            print(f"{Colors.YELLOW}[~] Пропущен:{Colors.END} {os.path.basename(path)} (содержимое не изменилось)")
+            return
+        else:
+            print(f"{Colors.CYAN}[!] Обновление:{Colors.END} {os.path.basename(path)} (изменения обнаружены)")
+
+    # Имя для заголовка: используем имя папки только если указан флаг -name
+    pl_name = name if use_folder_name else None
+
+    try:
+        if ext in ['m3u', 'm3u8']:
+            enc = 'utf-8-sig' if ext == 'm3u8' else 'cp1251'
             with open(path, 'w', encoding=enc, errors='replace') as f:
-                f.write("#EXTM3U\n" + "\n".join(tracks) + "\n")
+                f.write("#EXTM3U\n")
+                if pl_name:
+                    f.write(f"#PLAYLIST: {pl_name}\n")
+                f.write("\n".join(tracks) + "\n")
+
         elif ext == 'pls':
             with open(path, 'w', encoding='utf-8') as f:
                 f.write("[playlist]\n")
+                if pl_name:
+                    f.write(f"PlaylistName={pl_name}\n")
                 for i, t in enumerate(tracks, 1):
                     f.write(f"File{i}={t}\nTitle{i}={os.path.basename(t)}\n")
                 f.write(f"NumberOfEntries={len(tracks)}\nVersion=2\n")
-        elif ext in ['xspf', 'wpl']:
-            ns = "http://xspf.org" if ext == 'xspf' else ""
-            root_el = ET.Element("playlist", version="1", xmlns=ns) if ext == 'xspf' else ET.Element("smil")
-            if ext == 'xspf':
-                ET.SubElement(root_el, "title").text = name
-                tl = ET.SubElement(root_el, "trackList")
-                for t in tracks: ET.SubElement(ET.SubElement(tl, "track"), "location").text = t
-            else:
-                h = ET.SubElement(root_el, "head")
-                ET.SubElement(h, "title").text = name
-                seq = ET.SubElement(ET.SubElement(root_el, "body"), "seq")
-                for t in tracks: ET.SubElement(seq, "media", src=t)
+
+        elif ext == 'xspf':
+            root_el = ET.Element("playlist", version="1", xmlns="http://xspf.org")
+            if pl_name:
+                ET.SubElement(root_el, "title").text = pl_name
+            tl = ET.SubElement(root_el, "trackList")
+            for t in tracks:
+                ET.SubElement(ET.SubElement(tl, "track"), "location").text = t
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(minidom.parseString(ET.tostring(root_el)).toprettyxml(indent="  "))
-        print(f"{Colors.GREEN}[+] {Colors.END}Создан: {os.path.basename(path)} ({len(tracks)})")
+
+        elif ext == 'wpl':
+            root_el = ET.Element("smil")
+            h = ET.SubElement(root_el, "head")
+            if pl_name:
+                ET.SubElement(h, "title").text = pl_name
+            seq = ET.SubElement(ET.SubElement(root_el, "body"), "seq")
+            for t in tracks:
+                ET.SubElement(seq, "media", src=t)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(minidom.parseString(ET.tostring(root_el)).toprettyxml(indent="  "))
+
+        print(f"{Colors.GREEN}[+] Создан:{Colors.END} {os.path.basename(path)} ({len(tracks)} треков)")
+
     except Exception as e:
         print(f"{Colors.RED}[x] Ошибка записи: {e}{Colors.END}")
 
@@ -84,28 +207,21 @@ def save_playlist(path, tracks, ext, name):
 def find_match(query, db):
     """Улучшенный поиск: точное совпадение -> вхождение -> пословный поиск"""
     q_n = normalize_name(query)
-
-    # 1. Попытка прямого вхождения (как было раньше)
     for n, p in db:
         if q_n == n or q_n in n or n in q_n:
             return p
-
-    # 2. Пословный поиск (Keywords Match)
-    # Разбиваем запрос на значимые слова (длиннее 1 символа)
     words = [w for w in q_n.split() if len(w) > 1]
-    if not words: return None
-
+    if not words:
+        return None
     for n, p in db:
-        # Проверяем, что ВСЕ слова из запроса есть в названии файла
         if all(word in n for word in words):
             return p
-
     return None
 
 
-def process_list(list_file, db, ext, save_dir, absolute):
+def process_list(list_file, db, ext, save_dir, absolute, rel_base=None, use_folder_name=False):
     if not os.path.exists(list_file):
-        print(f"{Colors.RED}[x] Файл не найден: {list_file}{Colors.END}")
+        print(f"[x] Файл не найден: {list_file}")
         return
 
     with open(list_file, 'r', encoding='utf-8') as f:
@@ -117,10 +233,10 @@ def process_list(list_file, db, ext, save_dir, absolute):
         if match:
             found.append(match)
         else:
-            print(f"{Colors.YELLOW}    —{Colors.END} Не найден: {q}")
+            print(f"    — Не найден: {q}")
 
     pl_base = os.path.splitext(os.path.basename(list_file))[0]
-    save_playlist(os.path.join(save_dir, f"{pl_base}.{ext}"), found, ext, pl_base)
+    save_playlist(os.path.join(save_dir, f"{pl_base}.{ext}"), found, ext, pl_base, use_folder_name)
 
 
 def main():
@@ -131,39 +247,43 @@ def main():
     if args.from_list or args.mass:
         s_dir = os.path.abspath(args.searchdir or os.getcwd())
         save_dir = os.path.abspath(args.savedir or s_dir)
-        if not os.path.exists(save_dir): os.makedirs(save_dir)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
-        print(f"{Colors.CYAN}Индексация файлов в {s_dir}...{Colors.END}")
+        print(f"Индексация файлов в {s_dir}...")
         db = []
         for r, _, fs in os.walk(s_dir):
             for f in fs:
                 if f.lower().endswith(music_exts):
                     full_p = os.path.join(r, f)
-                    path_to_save = full_p if args.absolute else os.path.relpath(full_p, s_dir)
+                    path_to_save = format_path(full_p, base_dir=s_dir,
+                                               absolute=args.absolute, rel_base=args.relative_base)
                     db.append((normalize_name(f), path_to_save))
 
         if args.mass:
             mass_path = os.path.abspath(args.mass)
             if not os.path.isdir(mass_path):
-                print(f"{Colors.RED}[x] Папка не найдена: {mass_path}{Colors.END}");
+                print(f"[x] Папка не найдена: {mass_path}")
                 sys.exit(1)
 
             txt_files = [os.path.join(mass_path, f) for f in os.listdir(mass_path) if f.lower().endswith('.txt')]
             for txt in txt_files:
-                print(f"{Colors.CYAN}Обработка: {os.path.basename(txt)}{Colors.END}")
-                process_list(txt, db, ext, save_dir, args.absolute)
+                print("-" * 40)
+                print(f"Обработка: {os.path.basename(txt)}")
+                process_list(txt, db, ext, save_dir, args.absolute, args.relative_base, args.use_folder_name)
         else:
-            process_list(args.from_list, db, ext, save_dir, args.absolute)
+            process_list(args.from_list, db, ext, save_dir, args.absolute, args.relative_base, args.use_folder_name)
 
     else:
-        raw_p = args.path or args.savedir or input(f"{Colors.YELLOW}Путь к папке с музыке: {Colors.END}").strip()
+        raw_p = args.path or args.savedir or input("Путь к папке с музыке: ").strip()
         root_dir = os.path.abspath(raw_p)
         save_dir = os.path.abspath(args.savedir or root_dir)
 
         if not os.path.isdir(root_dir):
-            print(f"{Colors.RED}[x] Путь не найден.{Colors.END}");
+            print("[x] Путь не найден.")
             sys.exit(1)
-        if not os.path.exists(save_dir): os.makedirs(save_dir)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
         for entry in os.scandir(root_dir):
             if entry.is_dir() and os.path.abspath(entry.path) != save_dir:
@@ -172,10 +292,14 @@ def main():
                     for f in fs:
                         if f.lower().endswith(music_exts):
                             full_p = os.path.join(r, f)
-                            tracks.append(full_p if args.absolute else os.path.relpath(full_p, root_dir))
+                            track_path = format_path(full_p, base_dir=root_dir,
+                                                     absolute=args.absolute, rel_base=args.relative_base)
+                            tracks.append(track_path)
                 if tracks:
                     tracks.sort()
-                    save_playlist(os.path.join(save_dir, f"{entry.name}.{ext}"), tracks, ext, entry.name)
+                    tracks = [t.replace('\\', '/') for t in tracks]
+                    save_playlist(os.path.join(save_dir, f"{entry.name}.{ext}"),
+                                  tracks, ext, entry.name, args.use_folder_name)
 
 
 if __name__ == "__main__":

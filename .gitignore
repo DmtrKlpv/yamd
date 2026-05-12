@@ -5,9 +5,13 @@ env/
 downloads/
 token.py
 pls/
+dist/ffmpeg_bin/
+dist/ffmpeg.exe
 # Настройки PyCharm
 .idea/
 code
+ffmpeg.exe
+
 # Кэш Python
 __pycache__/
 *.py[cod]
