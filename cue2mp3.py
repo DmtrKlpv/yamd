@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FLAC + CUE to MP3 Converter
-Нарезает FLAC по временным меткам из CUE, кодирует в MP3,
+FLAC/APE + CUE to MP3 Converter
+Нарезает аудио (FLAC/APE) по временным меткам из CUE, кодирует в MP3,
 прописывает ID3v2.4 теги (UTF-8) и встраивает обложку.
 """
 
@@ -21,6 +21,7 @@ try:
     from mutagen.mp3 import MP3
     from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCON, TRCK, APIC
     from mutagen.flac import FLAC
+    from mutagen.apev2 import APEv2
 except ImportError:
     print("[ERROR] Отсутствует библиотека mutagen.")
     print("Установите: pip install mutagen")
@@ -29,7 +30,7 @@ except ImportError:
 
 def create_parser():
     parser = argparse.ArgumentParser(
-        description="Конвертер FLAC+CUE -> MP3 с тегами ID3v2.4 и обложкой.",
+        description="Конвертер FLAC/APE+CUE -> MP3 с тегами ID3v2.4 и обложкой.",
         epilog="Примеры:\n"
                "  python cue2mp3.py -i release.cue\n"
                "  python cue2mp3.py -i \"D:\\Music\\Album\" -o ./mp3 -q 320"
@@ -129,7 +130,7 @@ def parse_cue_content(content: str):
 
         m = re.match(r'FILE\s+"(.+)"', line, re.IGNORECASE)
         if m:
-            album_meta["FLAC_NAME"] = m.group(1)
+            album_meta["SOURCE_FILE"] = m.group(1)
             continue
 
         m = re.match(r'TRACK\s+(\d+)\s+AUDIO', line, re.IGNORECASE)
@@ -156,7 +157,6 @@ def parse_cue_content(content: str):
 
 
 def time_to_seconds(time_str: str) -> float:
-    """Преобразует MM:SS:FF (75 кадров/сек) в секунды."""
     m = re.match(r'(\d+):(\d+):(\d+)', time_str)
     if not m:
         return 0.0
@@ -164,23 +164,33 @@ def time_to_seconds(time_str: str) -> float:
     return minutes * 60 + seconds + frames / 75.0
 
 
-def extract_cover(flac_path: Path, base_dir: Path):
+def extract_cover(audio_path: Path, base_dir: Path):
+    """Пытается извлечь обложку из тегов (FLAC/APE) или найти в папке."""
+    # 1. Проверка встроенных тегов
     try:
-        audio = FLAC(flac_path)
-        if audio.pictures:
-            return audio.pictures[0].data
+        suffix = audio_path.suffix.lower()
+        if suffix == ".flac":
+            audio = FLAC(audio_path)
+            if audio.pictures:
+                return audio.pictures[0].data
+        elif suffix == ".ape":
+            audio = APEv2(audio_path)
+            # В APE обложка часто лежит в поле 'Cover Art (Front)' или просто 'Cover Art'
+            for key in audio.keys():
+                if "Cover Art" in key:
+                    return audio[key].value
     except Exception:
         pass
 
+    # 2. Поиск внешнего файла
     for fname in ["cover.jpg", "folder.jpg", "cover.png", "front.jpg", "albumart.jpg"]:
-        img_path = base_dir / fname
-        if img_path.exists():
-            return img_path.read_bytes()
+        for f in base_dir.glob("*"):
+            if f.name.lower() == fname:
+                return f.read_bytes()
     return None
 
 
 def get_mime_type(data: bytes) -> str:
-    """Определяет MIME-тип изображения по заголовку."""
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     elif data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -201,40 +211,29 @@ def main():
         if not cue_files:
             parser.error(f"В папке не найден .cue файл: {cue_path}")
         cue_path = cue_files[0]
-        if len(cue_files) > 1:
-            print(f"[WARN] Найдено несколько .cue файлов. Использую: {cue_path.name}")
         print(f"[INFO] Найден CUE файл: {cue_path.name}")
 
-    if not cue_path.is_file():
-        parser.error(f"Путь не является файлом: {cue_path}")
-
-    print(f"[INFO] Чтение CUE файла: {cue_path}")
     cue_content, detected_enc = read_cue_file(cue_path)
-    print(f"[INFO] Кодировка CUE: {detected_enc}")
-
     album_meta, tracks = parse_cue_content(cue_content)
     cue_dir = cue_path.parent
 
-    flac_name = album_meta.get("FLAC_NAME", "")
-    print(f"[INFO] FLAC файл из CUE: {flac_name}")
+    source_name = album_meta.get("SOURCE_FILE", "")
+    source_path = cue_dir / source_name if source_name else None
 
-    flac_path = cue_dir / flac_name if flac_name else None
-    if not flac_path or not flac_path.exists():
-        print(f"[WARN] Указанный FLAC не найден. Поиск в папке...")
-        flac_files = list(cue_dir.glob("*.flac"))
-        if flac_files:
-            flac_path = flac_files[0]
-            print(f"[INFO] Найден FLAC: {flac_path.name}")
+    # Поиск аудиофайла, если указанный в CUE не найден
+    if not source_path or not source_path.exists():
+        print(f"[WARN] Исходный файл не найден. Поиск альтернатив...")
+        valid_exts = [".flac", ".ape", ".wav", ".wv"]
+        found_audio = [f for f in cue_dir.glob("*") if f.suffix.lower() in valid_exts]
+        if found_audio:
+            source_path = found_audio[0]
+            print(f"[INFO] Использую аудио: {source_path.name}")
         else:
-            sys.exit("[ERROR] FLAC файл не найден.")
+            sys.exit("[ERROR] Аудиофайл (FLAC/APE) не найден в папке.")
 
     ffmpeg_path = resolve_ffmpeg()
     out_dir = Path(args.output).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[INFO] Выходная папка: {out_dir}")
-    print(f"[INFO] Качество: {args.quality}")
-    print(f"[INFO] Треков: {len(tracks)}")
 
     if args.quality == "v0":
         enc_args = ["-c:a", "libmp3lame", "-q:a", "0"]
@@ -242,7 +241,7 @@ def main():
         enc_args = ["-c:a", "libmp3lame", "-b:a", "320k"]
 
     total_tracks = len(tracks)
-    print("\n[INFO] Нарезка и кодирование треков...")
+    print(f"\n[INFO] Обработка: {source_path.name} -> MP3")
     print("-" * 60)
 
     for i, track in enumerate(tracks, start=1):
@@ -251,83 +250,55 @@ def main():
         start_sec = time_to_seconds(track.get("TIME", "00:00:00"))
         end_sec = time_to_seconds(tracks[i]["TIME"]) if i < total_tracks else None
 
-        print(f"{i:02d} из {total_tracks}: {track_performer} - {track_title}")
-        if args.debug:
-            print(f"      Время: {track.get('TIME', 'N/A')} ({start_sec:.2f}s - {end_sec:.2f}s)")
+        print(f"{i:02d}/{total_tracks}: {track_performer} - {track_title}")
 
-        cmd = [ffmpeg_path, "-i", str(flac_path)]
+        cmd = [ffmpeg_path, "-i", str(source_path)]
         if start_sec > 0:
             cmd.extend(["-ss", f"{start_sec:.3f}"])
         if end_sec is not None:
             cmd.extend(["-to", f"{end_sec:.3f}"])
         cmd.extend([*enc_args, "-y", "-loglevel", "error", str(out_dir / f"track_{i:02d}.mp3")])
 
-        if args.debug:
-            print(f"[DEBUG] Команда: {' '.join(cmd)}")
-
         try:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
-            stderr_msg = e.stderr.decode(errors='replace') if e.stderr else "Без вывода"
-            print(f"  [FAIL] Ошибка кодирования: {stderr_msg}")
+            print(f"  [FAIL] Ошибка FFmpeg на треке {i}")
             continue
 
-    cover_data = extract_cover(flac_path, cue_dir)
+    cover_data = extract_cover(source_path, cue_dir)
     cover_mime = get_mime_type(cover_data) if cover_data else "image/jpeg"
 
     print("-" * 60)
-    print("[INFO] Применение тегов ID3v2.4 (UTF-8) и обложки...")
-    print("-" * 60)
+    print("[INFO] Запись метаданных...")
 
     for i, track in enumerate(tracks, start=1):
         mp3_file = out_dir / f"track_{i:02d}.mp3"
-        if not mp3_file.exists():
-            print(f"[WARN] Пропущен трек {i}")
-            continue
-
-        track_title = track.get("TITLE", f"Track {i}")
-        track_performer = track.get("PERFORMER", album_meta.get("PERFORMER", ""))
+        if not mp3_file.exists(): continue
 
         audio = MP3(mp3_file)
-        if audio.tags is None:
-            audio.add_tags()
-
+        if audio.tags is None: audio.add_tags()
         audio.tags.version = (2, 4, 0)
-        enc = 3
 
-        audio.tags.add(TIT2(encoding=enc, text=[track_title]))
-        audio.tags.add(TPE1(encoding=enc, text=[track_performer]))
+        enc = 3  # UTF-8
+        audio.tags.add(TIT2(encoding=enc, text=[track.get("TITLE", "")]))
+        audio.tags.add(TPE1(encoding=enc, text=[track.get("PERFORMER", "")]))
         audio.tags.add(TALB(encoding=enc, text=[album_meta.get("TITLE", "")]))
         audio.tags.add(TDRC(encoding=enc, text=[album_meta.get("DATE", "")]))
         audio.tags.add(TCON(encoding=enc, text=[album_meta.get("GENRE", "")]))
         audio.tags.add(TRCK(encoding=enc, text=[f"{i:02d}"]))
 
-        # ИСПРАВЛЕНО: полное условие if cover_data:
         if cover_data:
-            for fid in list(audio.tags.keys()):
-                if fid.startswith("APIC"):
-                    del audio.tags[fid]
-            audio.tags.add(APIC(
-                encoding=enc,
-                mime=cover_mime,
-                type=3,
-                desc="Cover",
-                data=cover_data
-            ))
+            audio.tags.add(APIC(encoding=enc, mime=cover_mime, type=3, desc="Cover", data=cover_data))
 
         audio.save(v2_version=4)
 
-        clean_title = re.sub(r'[<>:"/\\|?*]', "", track_title).strip()
+        # Переименование
+        clean_title = re.sub(r'[<>:"/\\|?*]', "", track.get("TITLE", "Track")).strip()
         new_name = f"{i:02d} - {clean_title}.mp3"
         final_path = out_dir / new_name
-        if mp3_file != final_path:
-            os.rename(mp3_file, final_path)
+        os.replace(mp3_file, final_path)
 
-        print(f"[{i:02d}] {track_title} [meta: {album_meta.get('DATE', '')}]")
-
-    print("-" * 60)
-    print(f"[DONE] Готово! Файлы сохранены в: {out_dir}")
-    print(f"[INFO] Все теги записаны в кодировке UTF-8 (ID3v2.4)")
+    print(f"[DONE] Альбом готов в: {out_dir}")
 
 
 if __name__ == "__main__":
