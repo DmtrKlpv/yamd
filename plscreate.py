@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
 import argparse
 import xml.etree.ElementTree as ET
@@ -5,13 +7,14 @@ from xml.dom import minidom
 import sys
 import re
 
+
 class Colors:
     GREEN, RED, YELLOW, CYAN, GRAY, BOLD, END = '\033[92m', '\033[91m', '\033[93m', '\033[96m', '\033[90m', '\033[1m', '\033[0m'
 
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description="Утилита для создания плейлистов."
+        description="Утилита для создания плейлистов, совместимых с Navidrome."
     )
     parser.add_argument("path", nargs="?", help="Путь к музыке (откуда брать папки)")
     parser.add_argument(
@@ -19,7 +22,7 @@ def get_args():
         choices=["m3u", "m3u8", "pls", "xspf", "wpl"],
         help="Формат плейлиста:\n"
              "m3u   - Классический плейлист (ANSI)\n"
-             "m3u8  - Плейлист UTF-8 (для Foobar2000)\n"
+             "m3u8  - Плейлист UTF-8 (для Foobar2000/Navidrome)\n"
              "pls   - Плейлист Winamp/другие\n"
              "xspf  - XML формат (для VLC)\n"
              "wpl   - Windows Media Player"
@@ -31,7 +34,7 @@ def get_args():
     parser.add_argument("-abs", "--absolute", action="store_true", help="Использовать абсолютные пути в плейлисте")
     parser.add_argument("-rel", "--relative-base",
                         help="Базовый путь для относительных ссылок (например: '/music'). "
-                             "Пути в плейлисте будут начинаться с этого префикса (регистр не важен).")
+                             "Пути в плейлисте будут начинаться с этого префикса.")
     parser.add_argument("-name", "--use-folder-name", action="store_true",
                         help="Записать имя папки в заголовок плейлиста (поддерживается в PLS, XSPF, WPL, M3U)")
     return parser.parse_args()
@@ -53,30 +56,36 @@ def choose_format():
 
 def format_path(full_path, base_dir=None, absolute=False, rel_base=None):
     """
-    Форматирует путь согласно настройкам:
-    - Заменяет \\ на /
-    - Если указан rel_base, обрезает путь до этого префикса (без учёта регистра)
-    - Иначе использует относительный путь от base_dir или абсолютный
+    Форматирует путь согласно настройкам.
+    Для Navidrome: если указан -rel /music, пути будут начинаться с /music/...
     """
+    # Нормализуем слеши
     path = full_path.replace('\\', '/')
 
     if absolute:
         return path
 
     if rel_base:
+        # Нормализуем rel_base: убираем trailing slash, приводим к нижнему регистру для сравнения
         rel_base_norm = rel_base.replace('\\', '/').rstrip('/')
         path_lower = path.lower()
         rel_base_lower = rel_base_norm.lower()
 
+        # Ищем вхождение базового пути (без учёта регистра)
         if rel_base_lower in path_lower:
             idx = path_lower.find(rel_base_lower)
             if idx != -1:
+                # Сохраняем оригинальный регистр пути, но гарантируем префикс rel_base_norm
                 result = rel_base_norm + path[idx + len(rel_base_norm):]
+                # Убираем дублирующие слеши, если появились
+                result = re.sub(r'/+', '/', result)
                 return result
 
-        print(f" Префикс '{rel_base}' не найден в пути: {path}")
+        # Если не нашли — возвращаем как есть с предупреждением
+        print(f"{Colors.YELLOW}⚠ Префикс '{rel_base}' не найден в пути: {path}{Colors.END}")
         return path
 
+    # Если нет rel_base и absolute — делаем относительный путь от base_dir
     if base_dir:
         try:
             return os.path.relpath(full_path, base_dir).replace('\\', '/')
@@ -86,8 +95,8 @@ def format_path(full_path, base_dir=None, absolute=False, rel_base=None):
 
 
 def normalize_track_path(path):
-    """Нормализует путь трека для сравнения: заменяет слэши, приводит к нижнему регистру"""
-    return path.replace('\\', '/').lower().strip()
+    """Нормализует путь трека для сравнения: заменяет слэши, приводит к нижнему регистру, убирает \r"""
+    return path.replace('\\', '/').lower().strip().rstrip('\r\n')
 
 
 def read_playlist_tracks(playlist_path, ext):
@@ -101,17 +110,17 @@ def read_playlist_tracks(playlist_path, ext):
     tracks = []
     try:
         if ext in ['m3u', 'm3u8']:
-            enc = 'utf-8-sig' if ext == 'm3u8' else 'cp1251'
+            enc = 'utf-8' if ext == 'm3u8' else 'utf-8'
             with open(playlist_path, 'r', encoding=enc, errors='replace') as f:
                 for line in f:
-                    line = line.strip()
+                    line = line.strip().rstrip('\r\n')
                     if line and not line.startswith('#'):
                         tracks.append(normalize_track_path(line))
 
         elif ext == 'pls':
             with open(playlist_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    line = line.strip()
+                    line = line.strip().rstrip('\r\n')
                     if line.lower().startswith('file'):
                         _, path = line.split('=', 1)
                         tracks.append(normalize_track_path(path))
@@ -120,12 +129,10 @@ def read_playlist_tracks(playlist_path, ext):
             tree = ET.parse(playlist_path)
             root = tree.getroot()
             if ext == 'xspf':
-                # XSPF: <location> внутри <track>
                 for loc in root.iter('{http://xspf.org}location'):
                     if loc.text:
                         tracks.append(normalize_track_path(loc.text))
             else:
-                # WPL: <media src="...">
                 for media in root.iter('media'):
                     src = media.get('src')
                     if src:
@@ -139,7 +146,7 @@ def read_playlist_tracks(playlist_path, ext):
 def save_playlist(path, tracks, ext, name, use_folder_name=False):
     """
     Сохраняет плейлист в указанный формат.
-    Если плейлист существует и содержимое не изменилось — пропускает создание.
+    Критично для Navidrome: UTF-8 без BOM, Unix-переносы, стандартный #EXTM3U.
     """
     if not tracks:
         return
@@ -161,15 +168,21 @@ def save_playlist(path, tracks, ext, name, use_folder_name=False):
 
     try:
         if ext in ['m3u', 'm3u8']:
-            enc = 'utf-8-sig' if ext == 'm3u8' else 'cp1251'
-            with open(path, 'w', encoding=enc, errors='replace') as f:
+            # 🔧 КРИТИЧНО: чистый UTF-8 без BOM + Unix-переносы
+            with open(path, 'w', encoding='utf-8', newline='\n', errors='replace') as f:
+                # ✅ СТРОГО стандарт: #EXTM3U без суффикса!
+                # Navidrome берёт имя плейлиста из имени файла, а не из заголовка.
                 f.write("#EXTM3U\n")
-                if pl_name:
-                    f.write(f"#PLAYLIST: {pl_name}\n")
-                f.write("\n".join(tracks) + "\n")
+
+                # ✅ Пишем треки: сохраняем пути КАК ЕСТЬ (с /music/ если есть)
+                for track in tracks:
+                    # Гарантируем чистоту: только прямые слеши, без \r, без лишних пробелов
+                    clean = track.replace('\\', '/').rstrip('\r\n').strip()
+                    if clean:  # пропускаем пустые строки
+                        f.write(f"{clean}\n")
 
         elif ext == 'pls':
-            with open(path, 'w', encoding='utf-8') as f:
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write("[playlist]\n")
                 if pl_name:
                     f.write(f"PlaylistName={pl_name}\n")
@@ -184,7 +197,7 @@ def save_playlist(path, tracks, ext, name, use_folder_name=False):
             tl = ET.SubElement(root_el, "trackList")
             for t in tracks:
                 ET.SubElement(ET.SubElement(tl, "track"), "location").text = t
-            with open(path, 'w', encoding='utf-8') as f:
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(minidom.parseString(ET.tostring(root_el)).toprettyxml(indent="  "))
 
         elif ext == 'wpl':
@@ -195,7 +208,7 @@ def save_playlist(path, tracks, ext, name, use_folder_name=False):
             seq = ET.SubElement(ET.SubElement(root_el, "body"), "seq")
             for t in tracks:
                 ET.SubElement(seq, "media", src=t)
-            with open(path, 'w', encoding='utf-8') as f:
+            with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(minidom.parseString(ET.tostring(root_el)).toprettyxml(indent="  "))
 
         print(f"{Colors.GREEN}[+] Создан:{Colors.END} {os.path.basename(path)} ({len(tracks)} треков)")
@@ -275,7 +288,7 @@ def main():
             process_list(args.from_list, db, ext, save_dir, args.absolute, args.relative_base, args.use_folder_name)
 
     else:
-        raw_p = args.path or args.savedir or input("Путь к папке с музыке: ").strip()
+        raw_p = args.path or args.savedir or input("Путь к папке с музыкой: ").strip()
         root_dir = os.path.abspath(raw_p)
         save_dir = os.path.abspath(args.savedir or root_dir)
 
